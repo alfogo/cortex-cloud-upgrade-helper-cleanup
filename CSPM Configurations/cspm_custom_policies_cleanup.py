@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote
@@ -247,6 +248,65 @@ def build_payload(from_: int, to: int) -> Dict[str, Any]:
     }
 
 
+def _should_retry_response(resp: requests.Response) -> bool:
+    if resp.status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+
+    if isinstance(body, dict):
+        reply = body.get("reply") if isinstance(body.get("reply"), dict) else None
+        err_code = reply.get("err_code") if reply else None
+        err_msg = reply.get("err_msg") if reply else None
+        if err_code == 459:
+            return True
+        if isinstance(err_msg, str) and "duplicate request" in err_msg.lower():
+            return True
+
+    return False
+
+
+def _retry_delay_s(base_delay_s: float, attempt: int) -> float:
+    return base_delay_s * (2 ** attempt)
+
+
+def _post_with_retry(
+    *,
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout_s: int,
+    retries: int,
+    backoff_s: float,
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            resp = session.post(url, headers=headers, json=payload, timeout=timeout_s)
+            if _should_retry_response(resp) and attempt < retries:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    delay = float(retry_after)
+                else:
+                    delay = _retry_delay_s(backoff_s, attempt)
+                time.sleep(delay)
+                continue
+            return resp
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            time.sleep(_retry_delay_s(backoff_s, attempt))
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Request failed after retries")
+
+
 def fetch_all_policies(
     *,
     base_url: str,
@@ -254,8 +314,13 @@ def fetch_all_policies(
     timeout_s: int,
     page_size: int,
     max_pages: int,
+    retries: int,
+    backoff_s: float,
+    page_delay_s: float,
 ) -> List[Dict[str, Any]]:
     url = f"{base_url}/api/cloudsec/v1/policy/get_data?type=grid&table_name=CLOUDSEC_POLICIES"
+
+    session = requests.Session()
 
     all_items: List[Dict[str, Any]] = []
     total_expected: Optional[int] = None
@@ -265,7 +330,15 @@ def fetch_all_policies(
         to = from_ + page_size
         payload = build_payload(from_=from_, to=to)
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+        resp = _post_with_retry(
+            session=session,
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+            retries=retries,
+            backoff_s=backoff_s,
+        )
         resp.raise_for_status()
 
         body = resp.json()
@@ -289,6 +362,9 @@ def fetch_all_policies(
         if len(dict_items) < page_size:
             break
 
+        if page_delay_s > 0:
+            time.sleep(page_delay_s)
+
     return all_items
 
 
@@ -308,6 +384,9 @@ def main() -> None:
     p.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds")
     p.add_argument("--page-size", type=int, default=100, help="Page size (default 100)")
     p.add_argument("--max-pages", type=int, default=100, help="Max pages to fetch (default 100)")
+    p.add_argument("--retries", type=int, default=5, help="Retries for transient/duplicate errors")
+    p.add_argument("--retry-backoff", type=float, default=1.5, help="Base backoff seconds")
+    p.add_argument("--page-delay", type=float, default=0.25, help="Delay between pages in seconds")
     p.add_argument("--referer", help="Override Referer header (optional)")
     p.add_argument("--confirm", action="store_true", help="Actually delete matched policies")
     p.add_argument(
@@ -346,6 +425,9 @@ def main() -> None:
             timeout_s=args.timeout,
             page_size=args.page_size,
             max_pages=args.max_pages,
+            retries=args.retries,
+            backoff_s=args.retry_backoff,
+            page_delay_s=args.page_delay,
         )
     except requests.HTTPError as e:
         text = getattr(e.response, "text", "") if getattr(e, "response", None) is not None else ""
