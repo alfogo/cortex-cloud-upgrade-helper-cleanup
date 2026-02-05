@@ -252,6 +252,31 @@ def _read_clipboard_macos() -> str:
     return proc.stdout or ""
 
 
+def _read_clipboard_windows() -> str:
+    if sys.platform != "win32":
+        raise RuntimeError("Clipboard capture is only supported on Windows")
+
+    for exe in ("powershell", "pwsh"):
+        proc = subprocess.run(
+            [exe, "-NoProfile", "-Command", "Get-Clipboard"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout or ""
+
+    raise RuntimeError("Failed to read clipboard via PowerShell")
+
+
+def _read_clipboard() -> str:
+    if sys.platform == "darwin":
+        return _read_clipboard_macos()
+    if sys.platform == "win32":
+        return _read_clipboard_windows()
+    raise RuntimeError("Clipboard capture is only supported on macOS and Windows")
+
+
 def _base_url_from_url(url: str) -> str:
     s = urlsplit(url)
     if not s.scheme or not s.netloc:
@@ -419,7 +444,7 @@ def main() -> None:
 
     cap = sub.add_parser("capture", help="Capture a session from a copied 'curl ...' command")
     cap_src = cap.add_mutually_exclusive_group(required=True)
-    cap_src.add_argument("--from-clipboard", action="store_true", help="Read cURL from macOS clipboard")
+    cap_src.add_argument("--from-clipboard", action="store_true", help="Read cURL from clipboard (macOS/Windows)")
     cap_src.add_argument("--curl-file", type=Path, help="Read cURL from a file")
     cap_src.add_argument("--curl", help="cURL as a single string")
     cap.add_argument("--minimal-headers", action="store_true", help="Minimize headers to the useful subset")
@@ -442,7 +467,7 @@ def main() -> None:
 
     if args.cmd == "capture":
         if args.from_clipboard:
-            curl_text = _read_clipboard_macos()
+            curl_text = _read_clipboard()
         elif args.curl_file:
             curl_text = args.curl_file.read_text(encoding="utf-8")
         else:
