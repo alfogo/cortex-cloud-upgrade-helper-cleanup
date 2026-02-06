@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -283,12 +284,88 @@ def build_rule_disable_payload(*, name: str) -> Dict[str, Any]:
     }
 
 
-def delete_rule(*, base_url: str, headers: Dict[str, str], rule_id: str, timeout_s: int, name: str) -> int:
+def _should_retry_response(resp: requests.Response) -> bool:
+    if resp.status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+
+    if isinstance(body, dict):
+        reply = body.get("reply") if isinstance(body.get("reply"), dict) else None
+        err_code = reply.get("err_code") if reply else None
+        err_msg = reply.get("err_msg") if reply else None
+        if err_code == 459:
+            return True
+        if isinstance(err_msg, str) and "duplicate request" in err_msg.lower():
+            return True
+
+    return False
+
+
+def _retry_delay_s(base_delay_s: float, attempt: int) -> float:
+    return base_delay_s * (2 ** attempt)
+
+
+def _patch_with_retry(
+    *,
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout_s: int,
+    retries: int,
+    backoff_s: float,
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            _refresh_request_token(headers)
+            resp = session.patch(url, headers=headers, json=payload, timeout=timeout_s)
+            if _should_retry_response(resp) and attempt < retries:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    delay = float(retry_after)
+                else:
+                    delay = _retry_delay_s(backoff_s, attempt)
+                time.sleep(delay)
+                continue
+            return resp
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            time.sleep(_retry_delay_s(backoff_s, attempt))
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Delete request failed after retries")
+
+
+def delete_rule(
+    *,
+    session: requests.Session,
+    base_url: str,
+    headers: Dict[str, str],
+    rule_id: str,
+    timeout_s: int,
+    name: str,
+    retries: int,
+    backoff_s: float,
+) -> requests.Response:
     url = f"{base_url}/api/cloudsec/v1/rule/{rule_id}"
-    _refresh_request_token(headers)
     payload = build_rule_disable_payload(name=name)
-    resp = requests.patch(url, headers=headers, json=payload, timeout=timeout_s)
-    return resp.status_code
+    return _patch_with_retry(
+        session=session,
+        url=url,
+        headers=headers,
+        payload=payload,
+        timeout_s=timeout_s,
+        retries=retries,
+        backoff_s=backoff_s,
+    )
 
 
 def main() -> None:
@@ -302,6 +379,9 @@ def main() -> None:
     p.add_argument("--page-size", type=int, default=100, help="Page size (default 100)")
     p.add_argument("--max-pages", type=int, default=100, help="Max pages to fetch (default 100)")
     p.add_argument("--referer", help="Override Referer header (optional)")
+    p.add_argument("--delete-retries", type=int, default=5, help="Retries for delete calls")
+    p.add_argument("--delete-backoff", type=float, default=1.5, help="Base backoff for delete retries")
+    p.add_argument("--delete-delay", type=float, default=0.2, help="Delay between deletes in seconds")
     p.add_argument("--confirm", action="store_true", help="Actually delete matched rules")
     p.add_argument(
         "--out",
@@ -361,6 +441,7 @@ def main() -> None:
     success = 0
     fail = 0
     total = len(matched)
+    session_client = requests.Session()
     for idx, rule in enumerate(matched, start=1):
         rule_id = find_rule_id(rule)
         if not rule_id:
@@ -368,21 +449,39 @@ def main() -> None:
             print(f"Rule delete progress: {idx}/{total} (missing id)")
             continue
         try:
-            status = delete_rule(
+            resp = delete_rule(
+                session=session_client,
                 base_url=base_url,
                 headers=headers,
                 rule_id=rule_id,
                 timeout_s=args.timeout,
                 name=args.name,
+                retries=args.delete_retries,
+                backoff_s=args.delete_backoff,
             )
-            if 200 <= status < 300:
+            if 200 <= resp.status_code < 300:
                 success += 1
             else:
                 fail += 1
+                err_snippet = ""
+                try:
+                    err_snippet = resp.text.strip()
+                except Exception:
+                    err_snippet = ""
+                if err_snippet:
+                    err_snippet = f" {err_snippet[:200]}"
+                print(
+                    f"Rule delete progress: {idx}/{total} (status={resp.status_code}){err_snippet}"
+                )
+                if args.delete_delay > 0:
+                    time.sleep(args.delete_delay)
+                continue
             print(f"Rule delete progress: {idx}/{total}")
         except Exception:
             fail += 1
             print(f"Rule delete progress: {idx}/{total} (error)")
+        if args.delete_delay > 0:
+            time.sleep(args.delete_delay)
 
     print(f"Deleted cloud rules: success={success} fail={fail}")
 

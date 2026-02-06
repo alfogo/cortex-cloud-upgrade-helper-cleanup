@@ -187,6 +187,36 @@ def find_control_id(item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def item_matches_email(item: Any, email: str) -> bool:
+    if not isinstance(item, dict):
+        return False
+
+    for key in (
+        "created_by",
+        "createdBy",
+        "created_by_email",
+        "creator",
+        "owner",
+        "CREATED_BY",
+    ):
+        v = item.get(key)
+        if isinstance(v, str) and v.lower() == email.lower():
+            return True
+
+    target = email.lower()
+
+    def search(obj: Any) -> bool:
+        if isinstance(obj, str):
+            return target in obj.lower()
+        if isinstance(obj, dict):
+            return any(search(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(search(v) for v in obj)
+        return False
+
+    return search(item)
+
+
 def fetch_page(
     *,
     base_url: str,
@@ -217,6 +247,92 @@ def fetch_page(
     _vprint(verbose, f"json_parse_elapsed={(time.perf_counter() - t1):.3f}s")
 
     return parse_reply(body)
+
+
+def build_standards_payload() -> Dict[str, Any]:
+    return {"filter_data": {"filter": {}, "sort": [{"FIELD": "NAME", "ORDER": "ASC"}]}}
+
+
+def parse_standards_reply(body: Any) -> List[Dict[str, Any]]:
+    if not isinstance(body, dict):
+        return []
+
+    reply = body.get("reply") if isinstance(body.get("reply"), dict) else None
+    if isinstance(reply, dict):
+        for key in ("DATA", "data", "items", "rows", "results"):
+            val = reply.get(key)
+            if isinstance(val, list):
+                return [r for r in val if isinstance(r, dict)]
+
+    for key in ("data", "items", "rows", "results"):
+        val = body.get(key)
+        if isinstance(val, list):
+            return [r for r in val if isinstance(r, dict)]
+
+    return []
+
+
+def fetch_standards(
+    *,
+    base_url: str,
+    headers: Dict[str, str],
+    timeout_s: int,
+    verbose: bool,
+) -> List[Dict[str, Any]]:
+    url = f"{base_url}/api/webapp/get_data?type=grid&table_name=COMPLIANCE_STANDARDS"
+    payload = build_standards_payload()
+
+    _refresh_request_token(headers)
+    _vprint(verbose, f"POST {url}")
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+    resp.raise_for_status()
+
+    return parse_standards_reply(resp.json())
+
+
+def find_standard_id(item: Dict[str, Any]) -> Optional[str]:
+    for key in (
+        "standard_id",
+        "STANDARD_ID",
+        "id",
+        "ID",
+        "uuid",
+        "STANDARD_UUID",
+    ):
+        v = item.get(key)
+        if isinstance(v, str) and _UUID_RE.match(v):
+            return v
+        if isinstance(v, (str, int)) and key in {"id", "ID"}:
+            s = str(v)
+            if _UUID_RE.match(s):
+                return s
+
+    for k, v in item.items():
+        if not isinstance(k, str):
+            continue
+        if "id" not in k.lower():
+            continue
+        if isinstance(v, str) and _UUID_RE.match(v):
+            return v
+
+    return None
+
+
+def delete_standard(
+    *,
+    base_url: str,
+    headers: Dict[str, str],
+    timeout_s: int,
+    standard_id: str,
+    verbose: bool,
+) -> requests.Response:
+    url = f"{base_url}/api/webapp/platform/compliance/delete_standard/"
+    payload = {"standard_id": standard_id}
+
+    _refresh_request_token(headers)
+    _vprint(verbose, f"POST {url} standard_id={standard_id}")
+    return requests.post(url, headers=headers, json=payload, timeout=timeout_s)
 
 
 def delete_control(
@@ -367,106 +483,175 @@ def main() -> None:
         print(
             f"Dry run mode (no deletions). First page returned {len(first_items)} items in {first_elapsed:.3f}s."
         )
-        print("To actually delete controls, rerun with --confirm.")
-        return
+        print("To actually delete controls and standards, rerun with --confirm.")
 
-    # Confirm mode: page through the filtered result set to collect control IDs.
-    if filter_count is not None:
-        total_pages = (filter_count + args.page_size - 1) // args.page_size
-    else:
-        total_pages = None
+    if args.confirm:
+        # Confirm mode: page through the filtered result set to collect control IDs.
+        if filter_count is not None:
+            total_pages = (filter_count + args.page_size - 1) // args.page_size
+        else:
+            total_pages = None
 
-    control_ids: List[str] = []
+        control_ids: List[str] = []
 
-    # Include first page
-    for item in first_items:
-        cid = find_control_id(item)
-        if cid:
-            control_ids.append(cid)
-
-    print(
-        f"Fetched page 1{f'/{total_pages}' if total_pages is not None else ''}: "
-        f"{len(first_items)} items (ids collected: {len(control_ids)})"
-    )
-
-    page = 1
-    while True:
-        if page >= args.max_pages:
-            print(f"Stopping paging: reached max pages cap ({args.max_pages}).")
-            break
-
-        if filter_count is not None and len(control_ids) >= filter_count:
-            break
-
-        from_ = page * args.page_size
-        to = from_ + args.page_size
-
-        t_page = time.perf_counter()
-        items, _, _ = fetch_page(
-            base_url=base_url,
-            headers=headers,
-            timeout_s=args.timeout,
-            from_=from_,
-            to=to,
-            email=args.email,
-            verbose=args.verbose,
-        )
-        dt_page = time.perf_counter() - t_page
-
-        if not items:
-            break
-
-        for item in items:
+        # Include first page
+        for item in first_items:
             cid = find_control_id(item)
             if cid:
                 control_ids.append(cid)
 
-        human_page = page + 1
-        denom = f"/{total_pages}" if total_pages is not None else ""
         print(
-            f"Fetched page {human_page}{denom}: {len(items)} items "
-            f"(ids collected: {len(control_ids)}) in {dt_page:.3f}s"
+            f"Fetched page 1{f'/{total_pages}' if total_pages is not None else ''}: "
+            f"{len(first_items)} items (ids collected: {len(control_ids)})"
         )
 
-        page += 1
+        page = 1
+        while True:
+            if page >= args.max_pages:
+                print(f"Stopping paging: reached max pages cap ({args.max_pages}).")
+                break
 
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique_ids: List[str] = []
-    for cid in control_ids:
-        if cid not in seen:
-            seen.add(cid)
-            unique_ids.append(cid)
+            if filter_count is not None and len(control_ids) >= filter_count:
+                break
 
-    print(f"Deleting {len(unique_ids)} compliance controls...")
+            from_ = page * args.page_size
+            to = from_ + args.page_size
 
-    deleted = 0
-    failed = 0
-
-    for idx, control_id in enumerate(unique_ids, start=1):
-        try:
-            resp = delete_control(
+            t_page = time.perf_counter()
+            items, _, _ = fetch_page(
                 base_url=base_url,
                 headers=headers,
                 timeout_s=args.timeout,
-                control_id=control_id,
+                from_=from_,
+                to=to,
+                email=args.email,
+                verbose=args.verbose,
+            )
+            dt_page = time.perf_counter() - t_page
+
+            if not items:
+                break
+
+            for item in items:
+                cid = find_control_id(item)
+                if cid:
+                    control_ids.append(cid)
+
+            human_page = page + 1
+            denom = f"/{total_pages}" if total_pages is not None else ""
+            print(
+                f"Fetched page {human_page}{denom}: {len(items)} items "
+                f"(ids collected: {len(control_ids)}) in {dt_page:.3f}s"
+            )
+
+            page += 1
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_ids: List[str] = []
+        for cid in control_ids:
+            if cid not in seen:
+                seen.add(cid)
+                unique_ids.append(cid)
+
+        print(f"Deleting {len(unique_ids)} compliance controls...")
+
+        deleted = 0
+        failed = 0
+
+        for idx, control_id in enumerate(unique_ids, start=1):
+            try:
+                resp = delete_control(
+                    base_url=base_url,
+                    headers=headers,
+                    timeout_s=args.timeout,
+                    control_id=control_id,
+                    verbose=args.verbose,
+                )
+                if 200 <= resp.status_code < 300:
+                    deleted += 1
+                    print(f"[{idx}/{len(unique_ids)}] Deleted control {control_id}")
+                else:
+                    failed += 1
+                    print(
+                        f"[{idx}/{len(unique_ids)}] Delete failed for {control_id}: status={resp.status_code}"
+                    )
+                    if resp.text:
+                        print(resp.text)
+            except Exception as e:
+                failed += 1
+                print(f"[{idx}/{len(unique_ids)}] Error deleting {control_id}: {e}")
+
+        print(f"Deleted {deleted} controls; failed {failed}.")
+
+    print("Querying compliance standards catalog...")
+
+    try:
+        standards = fetch_standards(
+            base_url=base_url,
+            headers=headers,
+            timeout_s=args.timeout,
+            verbose=args.verbose,
+        )
+    except requests.HTTPError as e:
+        text = getattr(e.response, "text", "") if getattr(e, "response", None) is not None else ""
+        print(f"HTTP error fetching compliance standards: {e} {text}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error fetching compliance standards: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Total compliance standards: {len(standards)}")
+
+    matched_standards = [s for s in standards if item_matches_email(s, args.email)]
+    print(f"Compliance standards created by {args.email}: {len(matched_standards)}")
+
+    if not args.confirm:
+        return
+
+    standard_ids: List[str] = []
+    for item in matched_standards:
+        sid = find_standard_id(item)
+        if sid:
+            standard_ids.append(sid)
+
+    # Deduplicate while preserving order
+    seen_std: set[str] = set()
+    unique_standard_ids: List[str] = []
+    for sid in standard_ids:
+        if sid not in seen_std:
+            seen_std.add(sid)
+            unique_standard_ids.append(sid)
+
+    print(f"Deleting {len(unique_standard_ids)} compliance standards...")
+
+    deleted_std = 0
+    failed_std = 0
+
+    for idx, standard_id in enumerate(unique_standard_ids, start=1):
+        try:
+            resp = delete_standard(
+                base_url=base_url,
+                headers=headers,
+                timeout_s=args.timeout,
+                standard_id=standard_id,
                 verbose=args.verbose,
             )
             if 200 <= resp.status_code < 300:
-                deleted += 1
-                print(f"[{idx}/{len(unique_ids)}] Deleted control {control_id}")
+                deleted_std += 1
+                print(f"[{idx}/{len(unique_standard_ids)}] Deleted standard {standard_id}")
             else:
-                failed += 1
+                failed_std += 1
                 print(
-                    f"[{idx}/{len(unique_ids)}] Delete failed for {control_id}: status={resp.status_code}"
+                    f"[{idx}/{len(unique_standard_ids)}] Delete failed for {standard_id}: status={resp.status_code}"
                 )
                 if resp.text:
                     print(resp.text)
         except Exception as e:
-            failed += 1
-            print(f"[{idx}/{len(unique_ids)}] Error deleting {control_id}: {e}")
+            failed_std += 1
+            print(f"[{idx}/{len(unique_standard_ids)}] Error deleting {standard_id}: {e}")
 
-    print(f"Deleted {deleted} controls; failed {failed}.")
+    print(f"Deleted {deleted_std} standards; failed {failed_std}.")
 
 
 if __name__ == "__main__":

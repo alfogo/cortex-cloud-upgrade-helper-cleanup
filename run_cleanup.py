@@ -6,7 +6,7 @@ This wrapper calls:
 - CSPM Configurations/cspm_custom_policies_cleanup.py
 - CSPM Configurations/cspm_rules_cleanup.py
 - CSPM Configurations/automation_rules_cleanup.py
-- CSPM Configurations/custom_compliance_standards_clenaup.py
+- CSPM Configurations/custom_compliance_standards_cleanup.py
 
 It passes the chosen email to both scripts.
 """
@@ -28,7 +28,7 @@ AUTOMATION_RULES_SCRIPT = (
     BASE_DIR / "CSPM Configurations" / "automation_rules_cleanup.py"
 )
 COMPLIANCE_CONTROLS_SCRIPT = (
-    BASE_DIR / "CSPM Configurations" / "custom_compliance_standards_clenaup.py"
+    BASE_DIR / "CSPM Configurations" / "custom_compliance_standards_cleanup.py"
 )
 CWP_POLICIES_SCRIPT = (
     BASE_DIR / "CWP Configurations" / "policies_asset_groups_cleanup.py"

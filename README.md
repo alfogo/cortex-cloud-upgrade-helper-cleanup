@@ -14,6 +14,24 @@ Install dependencies (if not already installed):
 python3 -m pip install -r requirements.txt
 ```
 
+## Capture UI session headers (required for UI-backed scripts)
+Some scripts call UI-backed endpoints and require an authenticated browser session
+(cookies + anti-CSRF headers). You must capture that session once before running
+those scripts.
+
+1) In the Cortex Cloud UI, open DevTools and use "Copy as cURL" on a request
+	to a UI API endpoint.
+2) Run the capture helper and let it read the cURL from your clipboard:
+
+```bash
+python3 capture_headers_client.py capture --from-clipboard --out cortex_ui_headers.json --minimal-headers
+```
+
+This writes `cortex_ui_headers.json`, which is then used by UI-backed scripts
+like `cspm_custom_policies_cleanup.py`, `cspm_rules_cleanup.py`, and
+`custom_compliance_standards_cleanup.py`. The session file contains secrets,
+so do not commit it.
+
 Run the wrapper (dry-run by default):
 
 ```bash
@@ -50,7 +68,7 @@ Secrets and session files (for UI replay) must never be committed. See notes bel
 	- `cspm_custom_policies_cleanup.py`: list and optionally delete custom Cloud Security policies via the UI-backed endpoints (uses captured UI session headers).
 	- `cspm_rules_cleanup.py`: list and optionally delete CSPM rules created by a given user (UI-backed endpoints).
 	- `automation_rules_cleanup.py`: list and update automation rules (UI-backed); deletion is implemented by updating the rules table.
-	- `custom_compliance_standards_clenaup.py`: lists compliance controls (`COMPLIANCE_CONTROLS_CATALOG`) and optionally deletes controls created by a user.
+	- `custom_compliance_standards_cleanup.py`: lists compliance controls (`COMPLIANCE_CONTROLS_CATALOG`) and optionally deletes controls created by a user.
 
 - `CWP Configurations/policies_asset_groups_cleanup.py`: lists CWP policies and asset groups via the public API; filters policies by creator display name and asset groups by `XDM.ASSET_GROUP.CREATED_BY` (email). Supports deletions for both resource types and retries across common endpoint shapes.
 

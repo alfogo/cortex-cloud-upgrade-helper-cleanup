@@ -368,10 +368,58 @@ def fetch_all_policies(
     return all_items
 
 
-def delete_policy(*, base_url: str, headers: Dict[str, str], policy_id: str, timeout_s: int) -> int:
+def _delete_with_retry(
+    *,
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    timeout_s: int,
+    retries: int,
+    backoff_s: float,
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            resp = session.delete(url, headers=headers, timeout=timeout_s)
+            if _should_retry_response(resp) and attempt < retries:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    delay = float(retry_after)
+                else:
+                    delay = _retry_delay_s(backoff_s, attempt)
+                time.sleep(delay)
+                continue
+            return resp
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            time.sleep(_retry_delay_s(backoff_s, attempt))
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Delete request failed after retries")
+
+
+def delete_policy(
+    *,
+    session: requests.Session,
+    base_url: str,
+    headers: Dict[str, str],
+    policy_id: str,
+    timeout_s: int,
+    retries: int,
+    backoff_s: float,
+) -> requests.Response:
     url = f"{base_url}/api/cloudsec/v1/policy/{policy_id}"
-    resp = requests.delete(url, headers=headers, timeout=timeout_s)
-    return resp.status_code
+    return _delete_with_retry(
+        session=session,
+        url=url,
+        headers=headers,
+        timeout_s=timeout_s,
+        retries=retries,
+        backoff_s=backoff_s,
+    )
 
 
 def main() -> None:
@@ -387,6 +435,9 @@ def main() -> None:
     p.add_argument("--retries", type=int, default=5, help="Retries for transient/duplicate errors")
     p.add_argument("--retry-backoff", type=float, default=1.5, help="Base backoff seconds")
     p.add_argument("--page-delay", type=float, default=0.25, help="Delay between pages in seconds")
+    p.add_argument("--delete-retries", type=int, default=5, help="Retries for delete calls")
+    p.add_argument("--delete-backoff", type=float, default=1.5, help="Base backoff for delete retries")
+    p.add_argument("--delete-delay", type=float, default=0.2, help="Delay between deletes in seconds")
     p.add_argument("--referer", help="Override Referer header (optional)")
     p.add_argument("--confirm", action="store_true", help="Actually delete matched policies")
     p.add_argument(
@@ -451,6 +502,7 @@ def main() -> None:
     success = 0
     fail = 0
     total = len(matched)
+    session_client = requests.Session()
     for idx, policy in enumerate(matched, start=1):
         policy_id = find_policy_id(policy)
         if not policy_id:
@@ -458,20 +510,38 @@ def main() -> None:
             print(f"Policy delete progress: {idx}/{total} (missing id)")
             continue
         try:
-            status = delete_policy(
+            resp = delete_policy(
+                session=session_client,
                 base_url=base_url,
                 headers=headers,
                 policy_id=policy_id,
                 timeout_s=args.timeout,
+                retries=args.delete_retries,
+                backoff_s=args.delete_backoff,
             )
-            if 200 <= status < 300:
+            if 200 <= resp.status_code < 300:
                 success += 1
             else:
                 fail += 1
+                err_snippet = ""
+                try:
+                    err_snippet = resp.text.strip()
+                except Exception:
+                    err_snippet = ""
+                if err_snippet:
+                    err_snippet = f" {err_snippet[:200]}"
+                print(
+                    f"Policy delete progress: {idx}/{total} (status={resp.status_code}){err_snippet}"
+                )
+                if args.delete_delay > 0:
+                    time.sleep(args.delete_delay)
+                continue
             print(f"Policy delete progress: {idx}/{total}")
         except Exception:
             fail += 1
             print(f"Policy delete progress: {idx}/{total} (error)")
+        if args.delete_delay > 0:
+            time.sleep(args.delete_delay)
 
     print(f"Deleted cloud policies: success={success} fail={fail}")
 

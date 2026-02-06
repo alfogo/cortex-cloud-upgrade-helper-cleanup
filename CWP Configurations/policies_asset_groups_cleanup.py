@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -348,6 +349,7 @@ def main() -> None:
     p.add_argument("--name", help="Creator name (display name) used to match policy createdBy")
     p.add_argument("--email", help="Creator email used to match asset group createdBy")
     p.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds")
+    p.add_argument("--delete-delay", type=float, default=0.25, help="Delay between deletes (seconds)")
     p.add_argument("--confirm", action="store_true", help="Actually perform deletions")
     args = p.parse_args()
 
@@ -355,25 +357,39 @@ def main() -> None:
     api_key = args.api_key or os.environ.get("CORTEX_API_KEY")
     api_key_id = args.api_key_id or os.environ.get("CORTEX_API_KEY_ID")
 
-    # Interactive fallback for direct execution
-    if (not api_key or not api_key_id) and sys.stdin.isatty():
-        if not api_key:
-            api_key = input("CORTEX_API_KEY (Authorization): ").strip()
-        if not api_key_id:
-            api_key_id = input("CORTEX_API_KEY_ID (x-xdr-auth-id): ").strip()
+    missing_params: List[str] = []
+    if not fqdn:
+        missing_params.append("--fqdn/CORTEX_FQDN")
+    if not api_key:
+        missing_params.append("--api-key/CORTEX_API_KEY")
+    if not api_key_id:
+        missing_params.append("--api-key-id/CORTEX_API_KEY_ID")
 
-    if not fqdn or not api_key or not api_key_id:
+    if missing_params:
         print(
-            "Error: supply --fqdn, --api-key, and --api-key-id or set CORTEX_FQDN, CORTEX_API_KEY, CORTEX_API_KEY_ID env vars.",
+            "Error: missing required parameters: " + ", ".join(missing_params),
+            file=sys.stderr,
+        )
+        print(
+            "Supply --fqdn, --api-key, and --api-key-id or set the matching env vars.",
             file=sys.stderr,
         )
         sys.exit(2)
 
     creator_name = (args.name or os.environ.get("CORTEX_CREATOR_NAME") or "").strip()
     creator_email = (args.email or os.environ.get("CORTEX_CREATOR_EMAIL") or "").strip()
-    if not creator_name and not creator_email:
+    missing_filters: List[str] = []
+    if not creator_name:
+        missing_filters.append("--name/CORTEX_CREATOR_NAME")
+    if not creator_email:
+        missing_filters.append("--email/CORTEX_CREATOR_EMAIL")
+    if missing_filters:
         print(
-            "Error: supply at least one of --name or --email (or set CORTEX_CREATOR_NAME / CORTEX_CREATOR_EMAIL).",
+            "Error: missing required parameters: " + ", ".join(missing_filters),
+            file=sys.stderr,
+        )
+        print(
+            "Supply --name and --email or set the matching env vars.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -420,33 +436,10 @@ def main() -> None:
 
     if not args.confirm:
         print("Dry run mode (no deletions). To actually delete, rerun with --confirm flag.")
-        return
+        print("No delete calls were made.")
 
-    pol_success = 0
-    pol_fail = 0
-    pol_total = len(matched_policies)
-
-    if pol_total:
-        for idx, (pid, _) in enumerate(matched_policies, start=1):
-            try:
-                status, _text = delete_policy(base_url, headers, pid, timeout_s=args.timeout)
-                if 200 <= status < 300:
-                    pol_success += 1
-                else:
-                    pol_fail += 1
-                print(f"Policy delete progress: {idx}/{pol_total}")
-            except Exception:
-                pol_fail += 1
-                print(f"Policy delete progress: {idx}/{pol_total} (error)")
-
-    if pol_total:
-        print(f"Deleted CWP policies: success={pol_success} fail={pol_fail}")
-
-    # 2) Asset groups cleanup (list -> match -> delete). Must use creator email.
+    # 2) Asset groups cleanup (list -> match -> delete).
     asset_groups: List[Dict[str, Any]] = []
-    if not creator_email:
-        print("No --email provided; skipping asset group cleanup.")
-        return
 
     try:
         asset_groups = list_asset_groups(base_url, headers, timeout_s=args.timeout)
@@ -470,6 +463,33 @@ def main() -> None:
 
     print(f"Matched {len(matched_asset_groups)} asset groups created by {creator_email}")
 
+    if not args.confirm:
+        print(f"Dry run: would delete {len(matched_policies)} CWP policies.")
+        print(f"Dry run: would delete {len(matched_asset_groups)} asset groups.")
+        return
+
+    pol_success = 0
+    pol_fail = 0
+    pol_total = len(matched_policies)
+
+    if pol_total:
+        for idx, (pid, _) in enumerate(matched_policies, start=1):
+            try:
+                status, _text = delete_policy(base_url, headers, pid, timeout_s=args.timeout)
+                if 200 <= status < 300:
+                    pol_success += 1
+                else:
+                    pol_fail += 1
+                print(f"Policy delete progress: {idx}/{pol_total}")
+            except Exception:
+                pol_fail += 1
+                print(f"Policy delete progress: {idx}/{pol_total} (error)")
+            if args.delete_delay > 0 and idx < pol_total:
+                time.sleep(args.delete_delay)
+
+    if pol_total:
+        print(f"Deleted CWP policies: success={pol_success} fail={pol_fail}")
+
     ag_success = 0
     ag_fail = 0
     ag_total = len(matched_asset_groups)
@@ -486,6 +506,8 @@ def main() -> None:
             except Exception:
                 ag_fail += 1
                 print(f"Asset group delete progress: {idx}/{ag_total} (error)")
+            if args.delete_delay > 0 and idx < ag_total:
+                time.sleep(args.delete_delay)
 
     print(f"Deleted asset groups: success={ag_success} fail={ag_fail}")
 
