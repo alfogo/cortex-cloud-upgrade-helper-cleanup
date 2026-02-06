@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import uuid
@@ -119,13 +120,19 @@ def extract_items_and_total(body: Any) -> Tuple[List[Any], Optional[int]]:
             "total_rows",
             "count",
             "number_of_results",
+            "TOTAL_COUNT",
+            "FILTER_COUNT",
         )
 
         def find_total(obj: Any) -> Optional[int]:
             if isinstance(obj, dict):
                 for k in total_keys:
-                    if k in obj and isinstance(obj[k], int):
-                        return obj[k]
+                    if k in obj:
+                        v = obj[k]
+                        if isinstance(v, int):
+                            return v
+                        if isinstance(v, str) and v.isdigit():
+                            return int(v)
                 for v in obj.values():
                     t = find_total(v)
                     if t is not None:
@@ -175,21 +182,50 @@ def extract_items_and_total(body: Any) -> Tuple[List[Any], Optional[int]]:
     return [], None
 
 
+def _normalize_name(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
 def item_matches_name(item: Any, name: str) -> bool:
     if not isinstance(item, dict):
         return False
 
-    # Prefer explicit createdBy for rules.
-    for key in ("createdBy", "created_by", "creator", "owner"):
-        v = item.get(key)
-        if isinstance(v, str) and v.lower() == name.lower():
-            return True
+    target_norm = _normalize_name(name)
+    target_tokens = [token for token in target_norm.split(" ") if token]
 
-    target = name.lower()
+    def field_matches(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        value_norm = _normalize_name(value)
+        if not value_norm:
+            return False
+        if value_norm == target_norm:
+            return True
+        if target_tokens and all(token in value_norm for token in target_tokens):
+            return True
+        return False
+
+    # Prefer explicit created-by style fields for rules.
+    for key in (
+        "createdBy",
+        "created_by",
+        "creator",
+        "owner",
+        "createdByName",
+        "created_by_name",
+        "createdByDisplayName",
+        "lastModifiedBy",
+        "last_modified_by",
+        "lastModifiedByName",
+        "lastModifiedByDisplayName",
+    ):
+        if field_matches(item.get(key)):
+            return True
 
     def search(obj: Any) -> bool:
         if isinstance(obj, str):
-            return target in obj.lower()
+            return field_matches(obj)
         if isinstance(obj, dict):
             return any(search(v) for v in obj.values())
         if isinstance(obj, list):
@@ -197,6 +233,25 @@ def item_matches_name(item: Any, name: str) -> bool:
         return False
 
     return search(item)
+
+
+def _debug_rule_match(item: Dict[str, Any], name: str) -> None:
+    fields = (
+        "id",
+        "name",
+        "createdBy",
+        "createdByName",
+        "createdByDisplayName",
+        "lastModifiedBy",
+        "lastModifiedByName",
+        "lastModifiedByDisplayName",
+    )
+    print("Debug rule fields:")
+    for key in fields:
+        value = item.get(key)
+        if value is not None:
+            print(f"  {key}: {value}")
+    print(f"Match result for '{name}': {item_matches_name(item, name)}")
 
 
 def find_rule_id(item: Any) -> Optional[str]:
@@ -222,11 +277,11 @@ def build_payload(from_: int, to: int) -> Dict[str, Any]:
     return {
         "extraData": None,
         "filter_data": {
-            "sort": [{"FIELD": "severity", "ORDER": "DESC"}],
+            "sort": [{"FIELD": "lastModifiedBy", "ORDER": "ASC"}],
             "filter": {},
             "free_text": "",
             "visible_columns": None,
-            "locked": None,
+            "locked": {},
             "paging": {"from": from_, "to": to},
         },
         "jsons": [],
@@ -279,7 +334,7 @@ def fetch_all_rules(
 def build_rule_disable_payload(*, name: str) -> Dict[str, Any]:
     return {
         "enabled": False,
-        "endTs": 1770163148571,
+        "endTs": int(time.time() * 1000),
         "lastModifiedBy": name,
     }
 
@@ -376,17 +431,55 @@ def main() -> None:
     p.add_argument("--fqdn", help="Override Cortex UI FQDN (host only, no https://)")
     p.add_argument("--name", required=True, help="Creator name to filter (matches createdBy)")
     p.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds")
+    p.add_argument(
+        "--delete-timeout",
+        type=int,
+        help="HTTP timeout seconds for delete calls (defaults to --timeout)",
+    )
+    p.add_argument(
+        "--first-pass-retries",
+        type=int,
+        default=0,
+        help="Retries per delete on the first pass (default 0 to fail fast)",
+    )
     p.add_argument("--page-size", type=int, default=100, help="Page size (default 100)")
     p.add_argument("--max-pages", type=int, default=100, help="Max pages to fetch (default 100)")
     p.add_argument("--referer", help="Override Referer header (optional)")
     p.add_argument("--delete-retries", type=int, default=5, help="Retries for delete calls")
     p.add_argument("--delete-backoff", type=float, default=1.5, help="Base backoff for delete retries")
     p.add_argument("--delete-delay", type=float, default=0.2, help="Delay between deletes in seconds")
+    p.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=0,
+        help="Abort after N consecutive delete failures (0 disables)",
+    )
+    p.add_argument(
+        "--retry-rounds",
+        type=int,
+        default=10,
+        help="Extra immediate retry rounds for failed deletes (default 10)",
+    )
+    p.add_argument(
+        "--retry-round-delay",
+        type=float,
+        default=10.0,
+        help="Delay between retry rounds in seconds (default 10)",
+    )
     p.add_argument("--confirm", action="store_true", help="Actually delete matched rules")
     p.add_argument(
         "--out",
         type=Path,
         help="Write matched rules to this file (JSON). If omitted, prints counts only.",
+    )
+    p.add_argument(
+        "--debug-created-by",
+        action="store_true",
+        help="Print distinct createdBy/lastModifiedBy values from fetched rules.",
+    )
+    p.add_argument(
+        "--debug-rule-id",
+        help="Print key fields for a specific rule id and show match decision.",
     )
 
     args = p.parse_args()
@@ -411,6 +504,7 @@ def main() -> None:
             referer = captured_headers.get("referer") or captured_headers.get("Referer")
 
     headers = build_headers(session, base_url=base_url, referer=referer)
+    headers.setdefault("x-platform-module-name", "cspm")
 
     try:
         rules = fetch_all_rules(
@@ -430,6 +524,35 @@ def main() -> None:
 
     print(f"Found {len(rules)} cloud rules from {base_url}")
 
+    if args.debug_rule_id:
+        debug_target = str(args.debug_rule_id).strip()
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if str(rule.get("id", "")).strip() == debug_target:
+                _debug_rule_match(rule, args.name)
+                break
+        else:
+            print(f"Rule id not found in response: {debug_target}")
+
+    if args.debug_created_by:
+        created_values = set()
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            for key in ("createdBy", "createdByName", "createdByDisplayName"):
+                value = rule.get(key)
+                if isinstance(value, str) and value.strip():
+                    created_values.add(value.strip())
+            for key in ("lastModifiedBy", "lastModifiedByName", "lastModifiedByDisplayName"):
+                value = rule.get(key)
+                if isinstance(value, str) and value.strip():
+                    created_values.add(value.strip())
+
+        print(f"Distinct creator/modifier values: {len(created_values)}")
+        for value in sorted(created_values)[:50]:
+            print(f"  {value}")
+
     matched = [r for r in rules if item_matches_name(r, args.name)]
 
     print(f"Matched {len(matched)} cloud rules created by {args.name}")
@@ -438,14 +561,20 @@ def main() -> None:
         print("Dry run mode (no deletions). To actually delete cloud rules, rerun with --confirm flag.")
         return
 
+    delete_timeout_s = args.delete_timeout or args.timeout
+    first_pass_timeout_s = min(delete_timeout_s, 3)
+
     success = 0
     fail = 0
     total = len(matched)
     session_client = requests.Session()
+    failed_ids: List[str] = []
+    consecutive_failures = 0
     for idx, rule in enumerate(matched, start=1):
         rule_id = find_rule_id(rule)
         if not rule_id:
             fail += 1
+            consecutive_failures += 1
             print(f"Rule delete progress: {idx}/{total} (missing id)")
             continue
         try:
@@ -454,15 +583,17 @@ def main() -> None:
                 base_url=base_url,
                 headers=headers,
                 rule_id=rule_id,
-                timeout_s=args.timeout,
+                timeout_s=first_pass_timeout_s,
                 name=args.name,
-                retries=args.delete_retries,
+                retries=args.first_pass_retries,
                 backoff_s=args.delete_backoff,
             )
             if 200 <= resp.status_code < 300:
                 success += 1
+                consecutive_failures = 0
             else:
-                fail += 1
+                failed_ids.append(rule_id)
+                consecutive_failures += 1
                 err_snippet = ""
                 try:
                     err_snippet = resp.text.strip()
@@ -478,10 +609,67 @@ def main() -> None:
                 continue
             print(f"Rule delete progress: {idx}/{total}")
         except Exception:
-            fail += 1
+            failed_ids.append(rule_id)
+            consecutive_failures += 1
             print(f"Rule delete progress: {idx}/{total} (error)")
         if args.delete_delay > 0:
             time.sleep(args.delete_delay)
+        if args.max_consecutive_failures > 0 and consecutive_failures >= args.max_consecutive_failures:
+            print(
+                f"Aborting after {consecutive_failures} consecutive failures. "
+                "Rerun to retry remaining rules.",
+                file=sys.stderr,
+            )
+            break
+
+    if failed_ids:
+        remaining_failures = list(failed_ids)
+        for round_idx in range(1, args.retry_rounds + 1):
+            if not remaining_failures:
+                break
+            if round_idx == 1:
+                print(f"Retrying failed deletes immediately: {len(remaining_failures)} rules")
+            else:
+                print(f"Retry round {round_idx}/{args.retry_rounds}: {len(remaining_failures)} rules")
+            if args.retry_round_delay > 0:
+                print(f"Waiting {args.retry_round_delay:.1f}s before retry round {round_idx}")
+                time.sleep(args.retry_round_delay)
+
+            next_failures: List[str] = []
+            for idx, rule_id in enumerate(remaining_failures, start=1):
+                try:
+                    resp = delete_rule(
+                        session=session_client,
+                        base_url=base_url,
+                        headers=headers,
+                        rule_id=rule_id,
+                        timeout_s=delete_timeout_s,
+                        name=args.name,
+                        retries=0,
+                        backoff_s=0.0,
+                    )
+                    if 200 <= resp.status_code < 300:
+                        success += 1
+                    else:
+                        next_failures.append(rule_id)
+                        err_snippet = ""
+                        try:
+                            err_snippet = resp.text.strip()
+                        except Exception:
+                            err_snippet = ""
+                        if err_snippet:
+                            err_snippet = f" {err_snippet[:200]}"
+                        print(
+                            f"Rule retry progress: {idx}/{len(remaining_failures)} "
+                            f"(status={resp.status_code}){err_snippet}"
+                        )
+                except Exception:
+                    next_failures.append(rule_id)
+                    print(f"Rule retry progress: {idx}/{len(remaining_failures)} (error)")
+
+            remaining_failures = next_failures
+
+        fail += len(remaining_failures)
 
     print(f"Deleted cloud rules: success={success} fail={fail}")
 
